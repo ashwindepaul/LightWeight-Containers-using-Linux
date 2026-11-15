@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""MiniRun v3 - a small Linux container runtime CLI."""
+import argparse, json, os, re, subprocess, sys
+from datetime import datetime
+from pathlib import Path
+
+PROJECT_DIR = Path(__file__).resolve().parent
+CONTAINERS_DIR = PROJECT_DIR / "containers"
+RUNTIME_BIN = PROJECT_DIR / "bin" / "container_runtime"
+DEFAULT_ROOTFS = PROJECT_DIR / "myroot"
+CONTAINERS_DIR.mkdir(exist_ok=True)
+(PROJECT_DIR / "bin").mkdir(exist_ok=True)
+
+def need_root():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
+
+def config_path(name): return CONTAINERS_DIR / f"{name}.json"
+
+def validate_name(name):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", name):
+        raise SystemExit("Container name must start with a letter or digit and contain only letters, digits, '.', '_' or '-' (1-63 characters).")
+    return name
+
+def validate_limits(memory_mb, cpu_pct):
+    if memory_mb < 64 or memory_mb > 1_048_576:
+        raise SystemExit("Memory must be between 64 and 1048576 MB.")
+    if cpu_pct < 1 or cpu_pct > 800:
+        raise SystemExit("CPU limit must be between 1 and 800 percent.")
+
+def validate_envs(values):
+    for value in values or []:
+        key, sep, _ = value.partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise SystemExit(f"Invalid environment variable '{value}'. Use KEY=VALUE with a valid KEY.")
+
+def persistent_home(name):
+    home = CONTAINERS_DIR / name / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    return {"src": str(home.resolve()), "dst": "/root", "readonly": False}
+
+def load(name):
+    p = config_path(name)
+    if not p.exists(): raise SystemExit(f"Container '{name}' not found")
+    return json.loads(p.read_text())
+
+def runtime_cmd(c):
+    cmd = [str(RUNTIME_BIN), c["name"], c["rootfs"], c["command"], str(c.get("memory_mb",1024)), str(c.get("cpu_pct",100))]
+    if c.get("host_runtime"): cmd.append("--host-runtime")
+    cmd += ["--network", c.get("network", "host")]
+    if c.get("workdir"): cmd += ["--workdir", c["workdir"]]
+    for b in c.get("binds", []):
+        spec = f'{b["src"]}:{b["dst"]}' + (":ro" if b.get("readonly") else "")
+        cmd += ["--bind", spec]
+    for e in c.get("env", []): cmd += ["--env", e]
+    return cmd
+
+class MiniRun:
+    def doctor(self):
+        """Check the local environment without changing system state."""
+        import platform, shutil
+        checks = {
+            "platform": platform.platform(),
+            "effective_user_is_root": os.geteuid() == 0,
+            "gcc": shutil.which("gcc") or "missing",
+            "python3": shutil.which("python3") or "missing",
+            "runtime_binary": str(RUNTIME_BIN) if RUNTIME_BIN.exists() else "not built",
+            "rootfs": str(DEFAULT_ROOTFS) if DEFAULT_ROOTFS.exists() else "not set up",
+            "cgroup_v2": os.path.exists("/sys/fs/cgroup/cgroup.controllers"),
+            "containers_directory": str(CONTAINERS_DIR),
+        }
+        for key, value in checks.items():
+            print(f"{key:24} {value}")
+        missing = [k for k in ("gcc", "python3") if checks[k] == "missing"]
+        if not RUNTIME_BIN.exists():
+            print("\nNext step: ./minirun build")
+        if not DEFAULT_ROOTFS.exists():
+            print("Next step: sudo ./minirun setup")
+        if missing:
+            print("Missing required tools: " + ", ".join(missing))
+            return False
+        if platform.system() != "Linux":
+            print("MiniRun's native runtime requires Linux (Ubuntu/WSL2 is supported).")
+            return False
+        return True
+
+    def build(self):
+        print("Building MiniRun runtime...")
+        r = subprocess.run(["gcc","-O2","-Wall","-Wextra","-D_GNU_SOURCE","-o",str(RUNTIME_BIN),str(PROJECT_DIR/"src/container_runtime.c")])
+        if r.returncode == 0: RUNTIME_BIN.chmod(0o755); print(f"Built {RUNTIME_BIN}")
+        return r.returncode == 0
+
+    def setup(self):
+        need_root()
+        return subprocess.run(["bash", str(PROJECT_DIR/"setup_container.sh")]).returncode == 0
+
+    def create(self, name, rootfs=None, command="/bin/bash -l", memory_mb=1024, cpu_pct=100, host_runtime=False, project=None, workdir="/workspace", env=None, network="host"):
+        validate_name(name)
+        validate_limits(memory_mb, cpu_pct)
+        validate_envs(env)
+        if network not in ("host", "isolated"): raise SystemExit("Network must be 'host' or 'isolated'.")
+        p = config_path(name)
+        if p.exists(): print(f"Container '{name}' already exists"); return False
+        binds=[]
+        if project:
+            project=str(Path(project).resolve())
+            binds.append({"src":project,"dst":"/workspace","readonly":False})
+        binds.append(persistent_home(name))
+        c={"name":name,"rootfs":rootfs or str(DEFAULT_ROOTFS),"command":command,"memory_mb":memory_mb,"cpu_pct":cpu_pct,"host_runtime":host_runtime,"network":network,"workdir":workdir if project else "/","binds":binds,"env":env or [],"status":"created","created_at":datetime.now().isoformat()}
+        p.write_text(json.dumps(c,indent=2)); print(f"Created container '{name}'"); return True
+
+    def start(self,name):
+        validate_name(name)
+        c=load(name)
+        if not RUNTIME_BIN.exists():
+            print("Runtime not built. Run: ./minirun build"); return False
+        need_root()
+        c["status"]="running"; config_path(name).write_text(json.dumps(c,indent=2))
+        try: rc=subprocess.run(runtime_cmd(c)).returncode
+        finally:
+            c["status"]="stopped"; config_path(name).write_text(json.dumps(c,indent=2))
+        return rc==0
+
+    def run(self,args):
+        need_root()
+        validate_name(args.name)
+        validate_limits(args.memory, args.cpu)
+        validate_envs(args.env)
+        if not RUNTIME_BIN.exists():
+            if not self.build(): return False
+        rootfs=str(Path(args.rootfs).resolve())
+        project=str(Path(args.project).resolve()) if args.project else None
+        binds=[]
+        if project: binds.append({"src":project,"dst":"/workspace","readonly":False})
+        binds.append(persistent_home(args.name))
+        for spec in args.bind:
+            parts=spec.split(":")
+            if len(parts)<2 or not parts[0] or not parts[1]: print(f"Invalid bind: {spec}"); return False
+            binds.append({"src":str(Path(parts[0]).resolve()),"dst":parts[1],"readonly":len(parts)>2 and parts[2]=="ro"})
+        c={"name":args.name,"rootfs":rootfs,"command":args.command,"memory_mb":args.memory,"cpu_pct":args.cpu,"host_runtime":args.host_runtime,"network":args.network,"workdir":args.workdir,"binds":binds,"env":args.env,"status":"running","created_at":datetime.now().isoformat()}
+        config_path(args.name).write_text(json.dumps(c,indent=2))
+        try: return subprocess.run(runtime_cmd(c)).returncode==0
+        finally:
+            c["status"]="stopped"; config_path(args.name).write_text(json.dumps(c,indent=2))
+
+    def list(self):
+        files=sorted(CONTAINERS_DIR.glob("*.json"))
+        if not files: print("No containers."); return
+        print(f"{'NAME':22} {'STATUS':10} {'MEM':8} {'CPU':8} {'HOST-RUNTIME':12}")
+        print("-"*65)
+        for p in files:
+            c=json.loads(p.read_text()); print(f"{c['name']:22} {c.get('status','?'):10} {c.get('memory_mb',1024):>5}MB {c.get('cpu_pct',100):>5}% {str(c.get('host_runtime',False)):12}")
+
+    def info(self,name): validate_name(name); print(json.dumps(load(name),indent=2))
+    def delete(self,name):
+        validate_name(name)
+        p=config_path(name)
+        if not p.exists(): print(f"Container '{name}' not found"); return False
+        p.unlink(); print(f"Deleted '{name}'"); return True
+
+
+def main():
+    parser=argparse.ArgumentParser(prog="minirun",description="MiniRun v3 - Linux container runtime")
+    sub=parser.add_subparsers(dest="action")
+    sub.add_parser("build"); sub.add_parser("setup"); sub.add_parser("list"); sub.add_parser("doctor", help="Check runtime prerequisites")
+    c=sub.add_parser("create"); c.add_argument("name"); c.add_argument("--rootfs"); c.add_argument("--command",default="/bin/bash -l"); c.add_argument("--memory-mb",type=int,default=1024); c.add_argument("--cpu-pct",type=int,default=100); c.add_argument("--host-runtime",action="store_true"); c.add_argument("--network",choices=("host","isolated"),default="host"); c.add_argument("--project"); c.add_argument("--workdir",default="/workspace"); c.add_argument("--env",action="append",default=[])
+    r=sub.add_parser("run",help="Run a project directly"); r.add_argument("name"); r.add_argument("--rootfs",default=str(DEFAULT_ROOTFS)); r.add_argument("--project",default=None); r.add_argument("--command",required=True); r.add_argument("--workdir",default="/workspace"); r.add_argument("--memory",type=int,default=4096); r.add_argument("--cpu",type=int,default=200); r.add_argument("--host-runtime",action="store_true"); r.add_argument("--network",choices=("host","isolated"),default="host",help="host gives build tools network access; isolated creates a private network namespace"); r.add_argument("--bind",action="append",default=[]); r.add_argument("--env",action="append",default=[])
+    s=sub.add_parser("start"); s.add_argument("name"); i=sub.add_parser("info"); i.add_argument("name"); d=sub.add_parser("delete"); d.add_argument("name")
+    a=parser.parse_args(); m=MiniRun()
+    if a.action=="build": ok=m.build()
+    elif a.action=="setup": ok=m.setup()
+    elif a.action=="create": ok=m.create(a.name,a.rootfs,a.command,a.memory_mb,a.cpu_pct,a.host_runtime,a.project,a.workdir,a.env,a.network)
+    elif a.action=="run": ok=m.run(a)
+    elif a.action=="start": ok=m.start(a.name)
+    elif a.action=="list": m.list(); ok=True
+    elif a.action=="doctor": ok=m.doctor()
+    elif a.action=="info": m.info(a.name); ok=True
+    elif a.action=="delete": ok=m.delete(a.name)
+    else: parser.print_help(); ok=True
+    raise SystemExit(0 if ok else 1)
+if __name__=="__main__": main()

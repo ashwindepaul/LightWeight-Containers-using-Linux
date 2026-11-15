@@ -1,0 +1,9 @@
+{
+  "name": "minirun-desktop",
+  "version": "3.1.0",
+  "description": "A polished desktop control panel for the MiniRun Linux container runtime",
+  "main": "main.js",
+  "private": true,
+  "scripts": { "start": "electron .", "check": "node --check main.js && node --check preload.js && node --check renderer.js" },
+  "devDependencies": { "electron": "^35.0.0" }
+}
